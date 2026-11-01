@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -713,6 +714,68 @@ func TestStats(t *testing.T) {
 	want := Stats{Hits: 2, Misses: 3, BackedOff: 1, StaleServed: 2, Loads: 3, LoadErrors: 1}
 	if got := cache.Stats(); got != want {
 		t.Errorf("Stats = %+v, want %+v", got, want)
+	}
+}
+
+// flakyStore fails every other call, and has every feature except "missing".
+type flakyStore struct {
+	calls atomic.Uint64
+}
+
+var errFlaky = errors.New("flaky store")
+
+func (s *flakyStore) GetFeature(_ context.Context, key string) (Feature, error) {
+	if s.calls.Add(1)%2 == 0 {
+		return Feature{}, errFlaky
+	}
+	if key == "missing" {
+		return Feature{}, ErrNotFound
+	}
+	return Feature{Key: key, Enabled: true}, nil
+}
+
+func TestConcurrentAccessWithFailures(t *testing.T) {
+	var staleCalls atomic.Uint64
+	cache, err := NewCache(&flakyStore{}, Config{
+		TTL:          100 * time.Microsecond,
+		LoadTimeout:  time.Second,
+		MaxStale:     10 * time.Millisecond,
+		ErrorBackoff: 100 * time.Microsecond,
+		NotFoundTTL:  100 * time.Microsecond,
+		OnStale:      func(string, error) { staleCalls.Add(1) },
+	})
+	if err != nil {
+		t.Fatalf("NewCache: %v", err)
+	}
+
+	keys := []string{"a", "b", "c", "missing"}
+	deadline := time.Now().Add(100 * time.Millisecond)
+
+	var requests atomic.Uint64
+	var wg sync.WaitGroup
+	for g := 0; g < 20; g++ {
+		wg.Go(func() {
+			for i := g; time.Now().Before(deadline); i++ {
+				key := keys[i%len(keys)]
+				_, err := cache.GetFeature(context.Background(), key)
+				requests.Add(1)
+				if err != nil && !errors.Is(err, ErrNotFound) && !errors.Is(err, errFlaky) {
+					t.Errorf("GetFeature(%q): %v", key, err)
+				}
+				cache.Stats()
+			}
+		})
+	}
+	wg.Wait()
+
+	stats := cache.Stats()
+	if answered := stats.Hits + stats.Misses + stats.BackedOff; answered != requests.Load() {
+		t.Errorf("hits, misses and backed off = %d, want %d requests", answered, requests.Load())
+	}
+
+	// Every path must have run, or this test proves nothing about it.
+	if stats.Hits == 0 || stats.BackedOff == 0 || stats.StaleServed == 0 || stats.LoadErrors == 0 || staleCalls.Load() == 0 {
+		t.Errorf("a path was not exercised: %+v, onStale calls = %d", stats, staleCalls.Load())
 	}
 }
 
