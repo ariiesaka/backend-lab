@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"testing/synctest"
@@ -18,6 +19,7 @@ type fakeStore struct {
 	mu       sync.Mutex
 	features map[string]Feature
 	err      error
+	panicVal any
 	release  chan struct{}
 	calls    int
 }
@@ -38,6 +40,9 @@ func (s *fakeStore) GetFeature(ctx context.Context, key string) (Feature, error)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if s.panicVal != nil {
+		panic(s.panicVal)
+	}
 	if s.err != nil {
 		return Feature{}, s.err
 	}
@@ -74,6 +79,12 @@ func TestNewCacheRejectsInvalidConfig(t *testing.T) {
 	}
 	if _, err := NewCache(&fakeStore{}, Config{TTL: time.Minute, LoadTimeout: time.Second, MaxStale: -time.Second}); err == nil {
 		t.Error("negative max stale: expected error")
+	}
+	if _, err := NewCache(&fakeStore{}, Config{TTL: time.Minute, LoadTimeout: time.Second, ErrorBackoff: -time.Second}); err == nil {
+		t.Error("negative error backoff: expected error")
+	}
+	if _, err := NewCache(&fakeStore{}, Config{TTL: time.Minute, LoadTimeout: time.Second, NotFoundTTL: -time.Second}); err == nil {
+		t.Error("negative not found ttl: expected error")
 	}
 }
 
@@ -303,8 +314,8 @@ func TestLoadRechecksCache(t *testing.T) {
 	}
 
 	// A caller that missed just before the previous load finished gets here.
-	if _, err := cache.load(ctx, "checkout"); err != nil {
-		t.Fatalf("load: %v", err)
+	if r := cache.load(ctx, "checkout"); r.err != nil {
+		t.Fatalf("load: %v", r.err)
 	}
 
 	if store.calls != 1 {
@@ -484,6 +495,224 @@ func TestFailedFirstLoadReturnsError(t *testing.T) {
 
 	if _, err := cache.GetFeature(context.Background(), "checkout"); !errors.Is(err, errDB) {
 		t.Errorf("err = %v, want %v", err, errDB)
+	}
+}
+
+func TestBackoffSkipsStoreAfterFailure(t *testing.T) {
+	errDB := errors.New("db down")
+	store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}, err: errDB}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.errorBackoff = 10 * time.Second
+	ctx := context.Background()
+
+	for i := 0; i < 2; i++ {
+		if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, errDB) {
+			t.Fatalf("err = %v, want %v", err, errDB)
+		}
+	}
+	if store.calls != 1 {
+		t.Errorf("during backoff: store calls = %d, want 1", store.calls)
+	}
+
+	*now = now.Add(10*time.Second - time.Nanosecond)
+	if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, errDB) {
+		t.Errorf("just before retry: err = %v, want %v", err, errDB)
+	}
+	if store.calls != 1 {
+		t.Errorf("just before retry: store calls = %d, want 1", store.calls)
+	}
+
+	// The database recovered, so the retry succeeds and clears the failure.
+	store.err = nil
+	*now = now.Add(time.Nanosecond)
+	if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+		t.Errorf("at retry: IsEnabled = %v, %v, want the loaded value", enabled, err)
+	}
+	if store.calls != 2 {
+		t.Errorf("at retry: store calls = %d, want 2", store.calls)
+	}
+
+	store.err = errDB
+	*now = now.Add(time.Minute - time.Nanosecond)
+	if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+		t.Errorf("after recovery: IsEnabled = %v, %v, want the cached value", enabled, err)
+	}
+	if store.calls != 2 {
+		t.Errorf("after recovery: store calls = %d, want 2", store.calls)
+	}
+}
+
+func TestBackoffServesExpiredValue(t *testing.T) {
+	store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.maxStale = 15 * time.Second
+	cache.errorBackoff = 10 * time.Second
+
+	staleCalls := 0
+	cache.onStale = func(string, error) { staleCalls++ }
+
+	ctx := context.Background()
+	if _, err := cache.GetFeature(ctx, "checkout"); err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+
+	errDB := errors.New("db down")
+	store.err = errDB
+	*now = now.Add(time.Minute)
+	for i := 0; i < 3; i++ {
+		if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+			t.Fatalf("IsEnabled = %v, %v, want the expired value", enabled, err)
+		}
+	}
+	if store.calls != 2 {
+		t.Errorf("store calls = %d, want 2", store.calls)
+	}
+	if staleCalls != 1 {
+		t.Errorf("onStale calls = %d, want 1", staleCalls)
+	}
+
+	// The next retry fails at 10s and starts a new backoff, which outlasts
+	// MaxStale, so the cap still applies during it.
+	*now = now.Add(10 * time.Second)
+	if _, err := cache.GetFeature(ctx, "checkout"); err != nil {
+		t.Fatalf("second failed load: %v", err)
+	}
+	*now = now.Add(5 * time.Second)
+	if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, errDB) {
+		t.Errorf("past max stale during backoff: err = %v, want %v", err, errDB)
+	}
+	if store.calls != 3 {
+		t.Errorf("store calls = %d, want 3", store.calls)
+	}
+}
+
+func TestBackoffAnswersWithoutWaitingOnHungStore(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeStore{release: make(chan struct{})}
+		cache, _ := newTestCache(t, store, time.Minute)
+		cache.errorBackoff = time.Hour
+		ctx := context.Background()
+
+		if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("first call: err = %v, want %v", err, context.DeadlineExceeded)
+		}
+
+		start := time.Now()
+		if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("second call: err = %v, want %v", err, context.DeadlineExceeded)
+		}
+		if elapsed := time.Since(start); elapsed != 0 {
+			t.Errorf("second call waited %s, want no wait", elapsed)
+		}
+		if store.calls != 1 {
+			t.Errorf("store calls = %d, want 1", store.calls)
+		}
+	})
+}
+
+func TestStorePanicBecomesError(t *testing.T) {
+	store := &fakeStore{panicVal: "boom"}
+	cache, _ := newTestCache(t, store, time.Minute)
+	ctx := context.Background()
+
+	_, err := cache.GetFeature(ctx, "checkout")
+	if err == nil || !strings.Contains(err.Error(), "store panicked: boom") {
+		t.Fatalf("err = %v, want it to report the panic", err)
+	}
+
+	// The key is not stuck, and the store is tried again.
+	store.panicVal = nil
+	store.features = map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}
+	if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+		t.Errorf("IsEnabled = %v, %v, want the loaded value", enabled, err)
+	}
+}
+
+func TestStorePanicServesExpiredValue(t *testing.T) {
+	store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.maxStale = time.Minute
+	ctx := context.Background()
+
+	if _, err := cache.GetFeature(ctx, "checkout"); err != nil {
+		t.Fatalf("GetFeature: %v", err)
+	}
+
+	store.panicVal = "boom"
+	*now = now.Add(time.Minute)
+	if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+		t.Errorf("IsEnabled = %v, %v, want the expired value", enabled, err)
+	}
+}
+
+func TestNotFoundIsRemembered(t *testing.T) {
+	store := &fakeStore{features: map[string]Feature{}}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.notFoundTTL = 30 * time.Second
+	cache.maxStale = time.Hour
+	ctx := context.Background()
+
+	for i := 0; i < 3; i++ {
+		if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("err = %v, want %v", err, ErrNotFound)
+		}
+	}
+	if store.calls != 1 {
+		t.Errorf("store calls = %d, want 1", store.calls)
+	}
+
+	// The feature is created, and shows up once the answer expires.
+	store.features["checkout"] = Feature{Key: "checkout", Enabled: true}
+	*now = now.Add(30*time.Second - time.Nanosecond)
+	if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, ErrNotFound) {
+		t.Errorf("just before expiry: err = %v, want %v", err, ErrNotFound)
+	}
+	*now = now.Add(time.Nanosecond)
+	if enabled, err := cache.IsEnabled(ctx, "checkout"); err != nil || !enabled {
+		t.Errorf("at expiry: IsEnabled = %v, %v, want the new feature", enabled, err)
+	}
+}
+
+func TestExpiredNotFoundIsNotServedOnFailure(t *testing.T) {
+	store := &fakeStore{features: map[string]Feature{}}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.notFoundTTL = 30 * time.Second
+	cache.maxStale = time.Hour
+	ctx := context.Background()
+
+	if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("err = %v, want %v", err, ErrNotFound)
+	}
+
+	errDB := errors.New("db down")
+	store.err = errDB
+	*now = now.Add(30 * time.Second)
+	if _, err := cache.GetFeature(ctx, "checkout"); !errors.Is(err, errDB) {
+		t.Errorf("err = %v, want %v", err, errDB)
+	}
+}
+
+func TestStats(t *testing.T) {
+	store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}}
+	cache, now := newTestCache(t, store, time.Minute)
+	cache.maxStale = time.Minute
+	cache.errorBackoff = 10 * time.Second
+	cache.notFoundTTL = 30 * time.Second
+	ctx := context.Background()
+
+	cache.GetFeature(ctx, "checkout") // Miss and load.
+	cache.GetFeature(ctx, "checkout") // Hit.
+	cache.GetFeature(ctx, "missing")  // Miss and load, not a load error.
+	cache.GetFeature(ctx, "missing")  // Hit.
+
+	store.err = errors.New("db down")
+	*now = now.Add(time.Minute)
+	cache.GetFeature(ctx, "checkout") // Miss, failed load, stale.
+	cache.GetFeature(ctx, "checkout") // Backed off, stale.
+
+	want := Stats{Hits: 2, Misses: 3, BackedOff: 1, StaleServed: 2, Loads: 3, LoadErrors: 1}
+	if got := cache.Stats(); got != want {
+		t.Errorf("Stats = %+v, want %+v", got, want)
 	}
 }
 

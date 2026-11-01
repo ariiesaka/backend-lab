@@ -6,7 +6,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/singleflight"
@@ -38,31 +40,72 @@ type Config struct {
 	// MaxStale is how long past its TTL a feature may still be served when
 	// reloading it fails. Zero turns this off.
 	MaxStale time.Duration
+	// ErrorBackoff is how long a key is not retried after a failed load.
+	// Callers get the expired feature within MaxStale, or the last error,
+	// without waiting on the Store. Zero turns this off.
+	ErrorBackoff time.Duration
+	// NotFoundTTL is how long ErrNotFound is remembered for a key. Zero turns
+	// this off.
+	NotFoundTTL time.Duration
 	// OnStale, if set, is called when a failed reload is hidden by serving an
 	// expired feature, so the failure can be logged or counted. It is called
-	// once per failed load, not once per waiting caller.
+	// once per failed load, not once per waiting caller, and must not panic.
 	OnStale func(key string, err error)
+}
+
+// Stats counts what the Cache has done since it was created.
+type Stats struct {
+	// Hits is requests answered with a valid feature or a remembered
+	// ErrNotFound.
+	Hits uint64
+	// Misses is requests that had to wait for a load.
+	Misses uint64
+	// BackedOff is requests answered without a load because one failed recently.
+	BackedOff uint64
+	// StaleServed is requests answered with an expired feature.
+	StaleServed uint64
+	// Loads is calls to the Store.
+	Loads uint64
+	// LoadErrors is calls to the Store that failed. ErrNotFound is not a failure.
+	LoadErrors uint64
 }
 
 type entry struct {
 	feature   Feature
+	missing   bool // The Store reported ErrNotFound, so feature is not set.
 	expiresAt time.Time
+	failure   error // The last load failed, so do not retry before retryAt.
+	retryAt   time.Time
+}
+
+// result is the answer to one request for a feature.
+type result struct {
+	feature   Feature
+	err       error
+	stale     bool
+	backedOff bool
 }
 
 // Cache is a Store that answers from memory while a value is still valid and
 // falls through to the wrapped Store otherwise. Concurrent misses on a key
 // share one call to the Store. It is safe for concurrent use.
 type Cache struct {
-	store       Store
-	ttl         time.Duration
-	loadTimeout time.Duration
-	maxStale    time.Duration
-	onStale     func(key string, err error)
-	now         func() time.Time
-	loads       singleflight.Group
+	store        Store
+	ttl          time.Duration
+	loadTimeout  time.Duration
+	maxStale     time.Duration
+	errorBackoff time.Duration
+	notFoundTTL  time.Duration
+	onStale      func(key string, err error)
+	now          func() time.Time
+	loads        singleflight.Group
 
 	mu      sync.RWMutex
 	entries map[string]entry
+
+	stats struct {
+		hits, misses, backedOff, staleServed, loads, loadErrors atomic.Uint64
+	}
 }
 
 // NewCache returns a Cache in front of store using the given config.
@@ -79,40 +122,54 @@ func NewCache(store Store, cfg Config) (*Cache, error) {
 	if cfg.MaxStale < 0 {
 		return nil, fmt.Errorf("featurecontrol: max stale must not be negative, got %s", cfg.MaxStale)
 	}
+	if cfg.ErrorBackoff < 0 {
+		return nil, fmt.Errorf("featurecontrol: error backoff must not be negative, got %s", cfg.ErrorBackoff)
+	}
+	if cfg.NotFoundTTL < 0 {
+		return nil, fmt.Errorf("featurecontrol: not found ttl must not be negative, got %s", cfg.NotFoundTTL)
+	}
 	return &Cache{
-		store:       store,
-		ttl:         cfg.TTL,
-		loadTimeout: cfg.LoadTimeout,
-		maxStale:    cfg.MaxStale,
-		onStale:     cfg.OnStale,
-		now:         time.Now,
-		entries:     make(map[string]entry),
+		store:        store,
+		ttl:          cfg.TTL,
+		loadTimeout:  cfg.LoadTimeout,
+		maxStale:     cfg.MaxStale,
+		errorBackoff: cfg.ErrorBackoff,
+		notFoundTTL:  cfg.NotFoundTTL,
+		onStale:      cfg.OnStale,
+		now:          time.Now,
+		entries:      make(map[string]entry),
 	}, nil
 }
 
 // GetFeature returns the cached feature if it exists and has not expired.
 // Otherwise it waits for a single shared load from the Store, or until ctx is
 // done. If the load fails, every waiting caller gets the expired feature when
-// it is within MaxStale, and otherwise the error as is. Errors are never
-// cached, and ErrNotFound is always returned because the feature is gone.
+// it is within MaxStale, and otherwise the error as is. ErrNotFound is always
+// returned because the feature is gone.
 func (c *Cache) GetFeature(ctx context.Context, key string) (Feature, error) {
-	if feature, ok := c.lookup(key, 0); ok {
-		return feature, nil
-	}
-
-	result := c.loads.DoChan(key, func() (any, error) {
-		return c.load(ctx, key)
-	})
-
-	select {
-	case res := <-result:
-		if res.Err != nil {
-			return Feature{}, res.Err
+	r, ok := c.lookup(key)
+	switch {
+	case !ok:
+		c.stats.misses.Add(1)
+		shared := c.loads.DoChan(key, func() (any, error) {
+			return c.load(ctx, key), nil
+		})
+		select {
+		case res := <-shared:
+			r = res.Val.(result)
+		case <-ctx.Done():
+			return Feature{}, ctx.Err()
 		}
-		return res.Val.(Feature), nil
-	case <-ctx.Done():
-		return Feature{}, ctx.Err()
+	case r.backedOff:
+		c.stats.backedOff.Add(1)
+	default:
+		c.stats.hits.Add(1)
 	}
+
+	if r.stale {
+		c.stats.staleServed.Add(1)
+	}
+	return r.feature, r.err
 }
 
 // IsEnabled reports whether the feature is switched on.
@@ -124,51 +181,109 @@ func (c *Cache) IsEnabled(ctx context.Context, key string) (bool, error) {
 	return feature.Enabled, nil
 }
 
-// load calls the Store and caches the result. Other callers may be waiting on
-// it, so cancelling the caller that started it must not stop it.
-func (c *Cache) load(ctx context.Context, key string) (Feature, error) {
+// Stats returns the current counters.
+func (c *Cache) Stats() Stats {
+	return Stats{
+		Hits:        c.stats.hits.Load(),
+		Misses:      c.stats.misses.Load(),
+		BackedOff:   c.stats.backedOff.Load(),
+		StaleServed: c.stats.staleServed.Load(),
+		Loads:       c.stats.loads.Load(),
+		LoadErrors:  c.stats.loadErrors.Load(),
+	}
+}
+
+// load calls the Store and records the outcome. Other callers may be waiting
+// on it, so cancelling the caller that started it must not stop it.
+func (c *Cache) load(ctx context.Context, key string) result {
 	// The previous load may have finished after this caller's cache miss.
-	if feature, ok := c.lookup(key, 0); ok {
-		return feature, nil
+	if r, ok := c.lookup(key); ok {
+		return r
 	}
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), c.loadTimeout)
 	defer cancel()
 
-	feature, err := c.store.GetFeature(ctx, key)
-	if errors.Is(err, ErrNotFound) {
-		c.mu.Lock()
-		delete(c.entries, key)
-		c.mu.Unlock()
-		return Feature{}, err
-	}
-	if err != nil {
-		stale, ok := c.lookup(key, c.maxStale)
-		if !ok {
-			return Feature{}, err
-		}
-		if c.onStale != nil {
-			c.onStale(key, err)
-		}
-		return stale, nil
+	c.stats.loads.Add(1)
+	feature, err := c.readStore(ctx, key)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		c.stats.loadErrors.Add(1)
 	}
 
-	c.mu.Lock()
-	c.entries[key] = entry{feature: feature, expiresAt: c.now().Add(c.ttl)}
-	c.mu.Unlock()
-
-	return feature, nil
+	r := c.record(key, feature, err)
+	if r.stale && c.onStale != nil {
+		c.onStale(key, err)
+	}
+	return r
 }
 
-// lookup returns the cached feature if it expired less than grace ago, or has
-// not expired at all.
-func (c *Cache) lookup(key string, grace time.Duration) (Feature, bool) {
+// readStore calls the Store, turning a panic into an error. Loads run in their
+// own goroutine, where a panic would otherwise crash the process.
+func (c *Cache) readStore(ctx context.Context, key string) (feature Feature, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("featurecontrol: store panicked: %v\n%s", r, debug.Stack())
+		}
+	}()
+	return c.store.GetFeature(ctx, key)
+}
+
+// record stores the outcome of a load and returns the answer to give callers.
+func (c *Cache) record(key string, feature Feature, err error) result {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := c.now()
+	switch {
+	case err == nil:
+		c.entries[key] = entry{feature: feature, expiresAt: now.Add(c.ttl)}
+		return result{feature: feature}
+	case errors.Is(err, ErrNotFound):
+		delete(c.entries, key)
+		if c.notFoundTTL > 0 {
+			c.entries[key] = entry{missing: true, expiresAt: now.Add(c.notFoundTTL)}
+		}
+		return result{err: err}
+	}
+
+	e := c.entries[key]
+	if c.errorBackoff > 0 {
+		e.failure, e.retryAt = err, now.Add(c.errorBackoff)
+		c.entries[key] = e
+	}
+	return c.failureResult(e, err, now)
+}
+
+// lookup returns the answer held in memory, if there is one: a valid feature, a
+// remembered ErrNotFound, or the fallback during a backoff.
+func (c *Cache) lookup(key string) (result, bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	e, ok := c.entries[key]
-	if !ok || !c.now().Before(e.expiresAt.Add(grace)) {
-		return Feature{}, false
+	if !ok {
+		return result{}, false
 	}
-	return e.feature, true
+
+	now := c.now()
+	switch {
+	case now.Before(e.expiresAt) && e.missing:
+		return result{err: ErrNotFound}, true
+	case now.Before(e.expiresAt):
+		return result{feature: e.feature}, true
+	case e.failure != nil && now.Before(e.retryAt):
+		r := c.failureResult(e, e.failure, now)
+		r.backedOff = true
+		return r, true
+	}
+	return result{}, false
+}
+
+// failureResult returns the expired feature if it is within MaxStale, and
+// otherwise err.
+func (c *Cache) failureResult(e entry, err error, now time.Time) result {
+	if !e.missing && now.Before(e.expiresAt.Add(c.maxStale)) {
+		return result{feature: e.feature, stale: true}
+	}
+	return result{err: err}
 }
