@@ -367,6 +367,46 @@ func TestFailedReloadServesExpiredValue(t *testing.T) {
 	}
 }
 
+func TestConcurrentMissesShareOneExpiredValue(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}}
+		cache, now := newTestCache(t, store, time.Minute)
+		cache.maxStale = time.Minute
+
+		staleCalls := 0
+		cache.onStale = func(string, error) { staleCalls++ }
+
+		if _, err := cache.GetFeature(context.Background(), "checkout"); err != nil {
+			t.Fatalf("GetFeature: %v", err)
+		}
+
+		store.err = errors.New("db down")
+		store.release = make(chan struct{})
+		*now = now.Add(time.Minute)
+
+		var wg sync.WaitGroup
+		for i := 0; i < 50; i++ {
+			wg.Go(func() {
+				enabled, err := cache.IsEnabled(context.Background(), "checkout")
+				if err != nil || !enabled {
+					t.Errorf("IsEnabled = %v, %v, want the expired value", enabled, err)
+				}
+			})
+		}
+
+		synctest.Wait()
+		close(store.release)
+		wg.Wait()
+
+		if store.calls != 2 {
+			t.Errorf("store calls = %d, want 2", store.calls)
+		}
+		if staleCalls != 1 {
+			t.Errorf("onStale calls = %d, want 1", staleCalls)
+		}
+	})
+}
+
 func TestServingExpiredValueDoesNotRenewIt(t *testing.T) {
 	store := &fakeStore{features: map[string]Feature{"checkout": {Key: "checkout", Enabled: true}}}
 	cache, now := newTestCache(t, store, time.Minute)

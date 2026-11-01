@@ -16,25 +16,19 @@ flowchart LR
 
 ## Usage
 
-Implement `Store` against your database:
+`PostgresStore` reads from this table, through any `database/sql` Postgres driver your application registers. For another database, implement `Store`.
 
-```go
-type PostgresStore struct{ db *sql.DB }
-
-func (s *PostgresStore) GetFeature(ctx context.Context, key string) (featurecontrol.Feature, error) {
-	f := featurecontrol.Feature{Key: key}
-	err := s.db.QueryRowContext(ctx, `SELECT enabled FROM features WHERE key = $1`, key).Scan(&f.Enabled)
-	if errors.Is(err, sql.ErrNoRows) {
-		return featurecontrol.Feature{}, featurecontrol.ErrNotFound
-	}
-	return f, err
-}
+```sql
+CREATE TABLE features (
+	key     TEXT PRIMARY KEY,
+	enabled BOOLEAN NOT NULL
+);
 ```
 
-Then wrap it, with the settings taken from your config:
+Wrap the store in a cache, with the settings taken from your config:
 
 ```go
-cache, err := featurecontrol.NewCache(&PostgresStore{db: db}, featurecontrol.Config{
+cache, err := featurecontrol.NewCache(featurecontrol.NewPostgresStore(db), featurecontrol.Config{
 	TTL:         30 * time.Second,
 	LoadTimeout: 2 * time.Second,
 	MaxStale:    10 * time.Minute,
@@ -87,4 +81,10 @@ The TTL is the longest a flag change can take to reach a running instance. A sho
 
 ```bash
 cd go && go test ./featurecontrol/
+```
+
+The Postgres tests are skipped unless `FEATURECONTROL_TEST_POSTGRES_URL` is set. They drop and recreate the `features` table, so point it at a throwaway database. GitHub Actions runs them against a Postgres container, along with the race detector:
+
+```bash
+cd go && FEATURECONTROL_TEST_POSTGRES_URL=postgres://postgres:postgres@localhost:5432/postgres go test -race ./featurecontrol/
 ```
