@@ -1,3 +1,5 @@
 module github.com/ariiesaka/backend-lab/go
 
-go 1.22
+go 1.27.0
+
+require golang.org/x/sync v0.24.0
