@@ -23,7 +23,7 @@ type SnapshotConfig struct {
 	// LoadTimeout limits a single call to the SnapshotStore.
 	LoadTimeout time.Duration
 	// OnRefreshError, if set, is called when a background refresh fails, so the
-	// failure can be logged or counted. It must not panic.
+	// failure can be logged or counted. It must not panic or call Close.
 	OnRefreshError func(err error)
 }
 
@@ -123,7 +123,8 @@ func (s *Snapshot) Stats() SnapshotStats {
 }
 
 // Close stops refreshing and waits for the background work to end. The last
-// good set can still be read afterwards.
+// good set can still be read afterwards. It blocks for as long as a store
+// ignores its context, and forever if called from OnRefreshError.
 func (s *Snapshot) Close() {
 	s.closeOnce.Do(func() {
 		s.cancel()

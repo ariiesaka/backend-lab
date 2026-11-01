@@ -120,6 +120,7 @@ enabled, err := snapshot.IsEnabled(ctx, "new-checkout")
 - **The first load happens at startup.** If it fails, `NewSnapshot` returns the error, so an instance never serves without flags.
 - **A failed refresh keeps the last good set**, with no age limit. Watch `Stats().LastRefresh` and alert if it gets old.
 - **A panic in the store becomes a refresh error.** A panic in `OnRefreshError` crashes the process.
+- **`Close` waits for the refresh to end.** It blocks for as long as a store ignores its context, and forever if called from `OnRefreshError`.
 - **An empty result is taken as real.** If the table is emptied, every flag becomes `ErrNotFound` on the next refresh.
 - **Every refresh reads the whole table**, on every instance, whether or not anything changed. Instances started together also refresh at about the same time.
 
