@@ -107,6 +107,79 @@ func TestPostgresStoreStopsWhenContextEnds(t *testing.T) {
 	}
 }
 
+func TestPostgresStoreListFeatures(t *testing.T) {
+	db := newTestPostgres(t)
+	store := NewPostgresStore(db)
+	ctx := context.Background()
+
+	list, err := store.ListFeatures(ctx)
+	if err != nil {
+		t.Fatalf("ListFeatures: %v", err)
+	}
+	got := make(map[Feature]bool)
+	for _, feature := range list {
+		got[feature] = true
+	}
+	if len(list) != 2 || !got[Feature{Key: "on", Enabled: true}] || !got[Feature{Key: "off"}] {
+		t.Errorf("ListFeatures = %+v, want on and off", list)
+	}
+
+	execSQL(t, db, `DROP TABLE features`)
+	if _, err := store.ListFeatures(ctx); err == nil {
+		t.Error("missing table: expected error")
+	}
+}
+
+func TestSnapshotWithPostgres(t *testing.T) {
+	db := newTestPostgres(t)
+	refreshErrs := make(chan error, 1000)
+	snapshot, err := NewSnapshot(context.Background(), NewPostgresStore(db), SnapshotConfig{
+		RefreshInterval: 20 * time.Millisecond,
+		LoadTimeout:     200 * time.Millisecond,
+		OnRefreshError:  func(err error) { refreshErrs <- err },
+	})
+	if err != nil {
+		t.Fatalf("NewSnapshot: %v", err)
+	}
+	t.Cleanup(snapshot.Close)
+
+	ctx := context.Background()
+	if enabled, err := snapshot.IsEnabled(ctx, "on"); err != nil || !enabled {
+		t.Fatalf("IsEnabled = %v, %v, want true", enabled, err)
+	}
+
+	// A change in the database shows up without any read reaching it.
+	execSQL(t, db, `UPDATE features SET enabled = FALSE WHERE key = 'on'`)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		enabled, err := snapshot.IsEnabled(ctx, "on")
+		if err != nil {
+			t.Fatalf("IsEnabled: %v", err)
+		}
+		if !enabled {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the change never reached the snapshot")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// A hung database times out in the background, and reads carry on.
+	lockFeatures(t, db)
+	select {
+	case err := <-refreshErrs:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("OnRefreshError err = %v, want %v", err, context.DeadlineExceeded)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the hung refresh was never reported")
+	}
+	if enabled, err := snapshot.IsEnabled(ctx, "on"); err != nil || enabled {
+		t.Errorf("during hang: IsEnabled = %v, %v, want false", enabled, err)
+	}
+}
+
 func TestCacheWithPostgres(t *testing.T) {
 	db := newTestPostgres(t)
 	cache, now := newTestCache(t, NewPostgresStore(db), time.Minute)

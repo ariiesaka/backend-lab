@@ -8,4 +8,4 @@ Implementations can be in any language and are grouped by language.
 
 | Topic | Language | Summary |
 | --- | --- | --- |
-| [Feature control cache](go/featurecontrol) | Go | Serve feature flags from an in-memory cache with a configurable TTL, and call the database only when the value is missing or expired. |
+| [Feature control](go/featurecontrol) | Go | Two ways to serve feature flags without calling the database on every read: an on-demand cache with a configurable TTL, and a snapshot of every flag refreshed on a timer. |

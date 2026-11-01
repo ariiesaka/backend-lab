@@ -7,7 +7,7 @@ import (
 	"fmt"
 )
 
-// PostgresStore is a Store backed by this Postgres table:
+// PostgresStore is a Store and SnapshotStore backed by this Postgres table:
 //
 //	CREATE TABLE features (
 //		key     TEXT PRIMARY KEY,
@@ -23,6 +23,28 @@ type PostgresStore struct {
 // NewPostgresStore returns a PostgresStore that reads through db.
 func NewPostgresStore(db *sql.DB) *PostgresStore {
 	return &PostgresStore{db: db}
+}
+
+// ListFeatures reads every feature.
+func (s *PostgresStore) ListFeatures(ctx context.Context) ([]Feature, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT key, enabled FROM features`)
+	if err != nil {
+		return nil, fmt.Errorf("featurecontrol: list features: %w", err)
+	}
+	defer rows.Close()
+
+	var features []Feature
+	for rows.Next() {
+		var feature Feature
+		if err := rows.Scan(&feature.Key, &feature.Enabled); err != nil {
+			return nil, fmt.Errorf("featurecontrol: list features: %w", err)
+		}
+		features = append(features, feature)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("featurecontrol: list features: %w", err)
+	}
+	return features, nil
 }
 
 // GetFeature reads a feature, returning ErrNotFound if it has no row.

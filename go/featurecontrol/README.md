@@ -95,6 +95,50 @@ The TTL is the longest a flag change can take to reach a running instance. A sho
 - **No manual invalidation.** A change takes effect only when the TTL runs out.
 - **Entries are never evicted.** Expired values, remembered not-founds and failures stay in memory until replaced. This is fine for a small, fixed set of flags, but keys must not come from user input, or memory can grow without limit.
 
+## Snapshot: the other design
+
+`Cache` loads each key on demand, so a request can still wait on the database. `Snapshot` instead keeps every flag in memory and reloads them all on a timer, so reads never touch the database.
+
+```go
+snapshot, err := featurecontrol.NewSnapshot(ctx, featurecontrol.NewPostgresStore(db), featurecontrol.SnapshotConfig{
+	RefreshInterval: 30 * time.Second,
+	LoadTimeout:     2 * time.Second,
+	OnRefreshError: func(err error) {
+		log.Printf("feature refresh failed: %v", err)
+	},
+})
+if err != nil {
+	return err // Could not load the flags, so do not start serving.
+}
+defer snapshot.Close()
+
+enabled, err := snapshot.IsEnabled(ctx, "new-checkout")
+```
+
+`Snapshot` also implements `Store`, so callers can switch between the two without changing.
+
+- **The first load happens at startup.** If it fails, `NewSnapshot` returns the error, so an instance never serves without flags.
+- **A failed refresh keeps the last good set**, with no age limit. Watch `Stats().LastRefresh` and alert if it gets old.
+- **A panic in the store becomes a refresh error.** A panic in `OnRefreshError` crashes the process.
+- **An empty result is taken as real.** If the table is emptied, every flag becomes `ErrNotFound` on the next refresh.
+- **Every refresh reads the whole table**, on every instance, whether or not anything changed. Instances started together also refresh at about the same time.
+
+### Which to use
+
+| | `Cache` | `Snapshot` |
+| --- | --- | --- |
+| Reads touch the database | Yes, on a miss | Never |
+| Slowest read | Up to `LoadTimeout` | A map lookup |
+| Database load | Only for keys in use, when requested | Whole table, every interval, even when idle |
+| First request after startup | Can fail or wait | Already loaded |
+| Database outage | Old value up to `MaxStale`, then errors | Last good set, with no limit |
+| Unknown keys | Reach the database, and can stay in memory | Answered from memory, and nothing stored |
+| Change takes effect within | `TTL` | `RefreshInterval` |
+| Background goroutine, needs `Close` | No | Yes |
+| Good fit | Many keys with few in use, or per-key values too large to load up front | A small set of flags read on hot paths |
+
+For flags in production, prefer `Snapshot`. It has fewer failure modes, and it is safe if keys ever come from user input. `Cache` shows how to solve the harder general problem, and it fits data that is too large to hold in memory.
+
 ## Tests
 
 ```bash
